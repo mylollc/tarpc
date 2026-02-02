@@ -29,7 +29,7 @@ use std::{
     },
     time::SystemTime,
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::Span;
 
 /// Settings that control the behavior of the client.
@@ -93,14 +93,78 @@ const _CHECK_USIZE: () = assert!(
     "usize is too big to fit in u64"
 );
 
+/// Type-erased dispatch future for self-driving mode.
+type BoxedDispatch = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+/// A handle to the dispatch future that can be spawned or ignored.
+///
+/// - If spawned (native): Takes dispatch from shared storage and runs it in background.
+///   Channel::call() will see None and just await responses normally.
+/// - If dropped without spawning (WASM): Dispatch stays in shared storage.
+///   Channel::call() will drive it while waiting for responses.
+pub struct DispatchHandle {
+    shared: Arc<Mutex<Option<BoxedDispatch>>>,
+    taken: Option<BoxedDispatch>,
+}
+
+/// Error type for DispatchHandle - dispatch ended (connection closed).
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("dispatch ended")]
+pub struct DispatchEnded;
+
+impl Future for DispatchHandle {
+    type Output = Result<(), DispatchEnded>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // First poll: take dispatch from shared storage
+        if self.taken.is_none() {
+            let taken_dispatch = {
+                if let Ok(mut guard) = self.shared.try_lock() {
+                    guard.take()
+                } else {
+                    // Mutex is contended, wake and retry
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+            };
+            self.taken = taken_dispatch;
+        }
+
+        // Poll the dispatch if we have it
+        if let Some(ref mut dispatch) = self.taken {
+            match dispatch.as_mut().poll(cx) {
+                Poll::Ready(()) => Poll::Ready(Ok(())),
+                Poll::Pending => Poll::Pending,
+            }
+        } else {
+            // Dispatch was already taken by Channel::call() or another handle
+            Poll::Ready(Ok(()))
+        }
+    }
+}
+
 /// Handles communication from the client to request dispatch.
-#[derive(Debug)]
 pub struct Channel<Req, Resp> {
     to_dispatch: mpsc::Sender<DispatchRequest<Req, Resp>>,
     /// Channel to send a cancel message to the dispatcher.
     cancellation: RequestCancellation,
     /// The ID to use for the next request to stage.
     next_request_id: Arc<AtomicUsize>,
+    /// Optional dispatch for self-driving mode (WASM).
+    /// When spawned on native, this is None and dispatch runs in background.
+    /// When not spawned, call() will drive this dispatch.
+    dispatch: Arc<Mutex<Option<BoxedDispatch>>>,
+}
+
+impl<Req, Resp> fmt::Debug for Channel<Req, Resp> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Channel")
+            .field("to_dispatch", &self.to_dispatch)
+            .field("cancellation", &self.cancellation)
+            .field("next_request_id", &self.next_request_id)
+            .field("dispatch", &"...")
+            .finish()
+    }
 }
 
 impl<Req, Resp> Clone for Channel<Req, Resp> {
@@ -109,6 +173,7 @@ impl<Req, Resp> Clone for Channel<Req, Resp> {
             to_dispatch: self.to_dispatch.clone(),
             cancellation: self.cancellation.clone(),
             next_request_id: self.next_request_id.clone(),
+            dispatch: self.dispatch.clone(),
         }
     }
 }
@@ -161,7 +226,39 @@ where
             })
             .await
             .map_err(|mpsc::error::SendError(_)| RpcError::Shutdown)?;
-        response_guard.response().await
+
+        // Drive the dispatch while awaiting the response (self-driving mode).
+        // If dispatch was spawned, this is a no-op (dispatch is None).
+        self.drive_response(response_guard).await
+    }
+
+    /// Drives the dispatch while awaiting a response.
+    /// This enables self-driving mode where call() polls the dispatch.
+    async fn drive_response(&self, mut response_guard: ResponseGuard<'_, Resp>) -> Result<Resp, RpcError> {
+        let dispatch = self.dispatch.clone();
+
+        futures::future::poll_fn(|cx| {
+            // Try to drive the dispatch if it's still available (not spawned)
+            if let Ok(mut guard) = dispatch.try_lock() {
+                if let Some(ref mut dispatch) = *guard {
+                    // Poll dispatch to make progress on I/O
+                    let _ = dispatch.as_mut().poll(cx);
+                }
+            }
+
+            // Poll the response
+            match Pin::new(&mut *response_guard.response).poll(cx) {
+                Poll::Ready(Ok(result)) => {
+                    response_guard.cancel = false;
+                    Poll::Ready(result)
+                }
+                Poll::Ready(Err(oneshot::error::RecvError { .. })) => {
+                    response_guard.cancel = false;
+                    Poll::Ready(Err(RpcError::Shutdown))
+                }
+                Poll::Pending => Poll::Pending,
+            }
+        }).await
     }
 }
 
@@ -195,23 +292,6 @@ pub enum RpcError {
     Server(#[from] ServerError),
 }
 
-impl<Resp> ResponseGuard<'_, Resp> {
-    async fn response(mut self) -> Result<Resp, RpcError> {
-        let response = (&mut self.response).await;
-        // Cancel drop logic once a response has been received.
-        self.cancel = false;
-        match response {
-            Ok(response) => response,
-            Err(oneshot::error::RecvError { .. }) => {
-                // The oneshot is Canceled when the dispatch task ends. In that case,
-                // there's nothing listening on the other side, so there's no point in
-                // propagating cancellation.
-                Err(RpcError::Shutdown)
-            }
-        }
-    }
-}
-
 // Cancels the request when dropped, if not already complete.
 impl<Resp> Drop for ResponseGuard<'_, Resp> {
     fn drop(&mut self) {
@@ -234,29 +314,45 @@ impl<Resp> Drop for ResponseGuard<'_, Resp> {
 
 /// Returns a channel and dispatcher that manages the lifecycle of requests initiated by the
 /// channel.
+///
+/// The returned `DispatchHandle` can be:
+/// - **Spawned** (native): `tokio::spawn(dispatch)` - dispatch runs in background
+/// - **Dropped** (WASM): Don't spawn it - `Channel::call()` will drive it automatically
 pub fn new<Req, Resp, C>(
     config: Config,
     transport: C,
-) -> NewClient<Channel<Req, Resp>, RequestDispatch<Req, Resp, C>>
+) -> NewClient<Channel<Req, Resp>, DispatchHandle>
 where
-    C: Transport<ClientMessage<Req>, Response<Resp>>,
+    C: Transport<ClientMessage<Req>, Response<Resp>> + Send + 'static,
+    Req: Send + 'static,
+    Resp: Send + 'static,
 {
     let (to_dispatch, pending_requests) = mpsc::channel(config.pending_request_buffer);
     let (cancellation, canceled_requests) = cancellations();
+
+    let dispatch = RequestDispatch {
+        config,
+        canceled_requests,
+        transport: transport.fuse(),
+        in_flight_requests: InFlightRequests::default(),
+        pending_requests,
+        terminal_error: None,
+    };
+
+    // Type-erase the dispatch and wrap in shared storage
+    let boxed: BoxedDispatch = Box::pin(dispatch.map(|_| ()));
+    let shared = Arc::new(Mutex::new(Some(boxed)));
 
     NewClient {
         client: Channel {
             to_dispatch,
             cancellation,
             next_request_id: Arc::new(AtomicUsize::new(0)),
+            dispatch: shared.clone(),
         },
-        dispatch: RequestDispatch {
-            config,
-            canceled_requests,
-            transport: transport.fuse(),
-            in_flight_requests: InFlightRequests::default(),
-            pending_requests,
-            terminal_error: None,
+        dispatch: DispatchHandle {
+            shared,
+            taken: None,
         },
     }
 }
@@ -703,6 +799,7 @@ mod tests {
     use tokio::sync::{
         mpsc::{self},
         oneshot,
+        Mutex,
     };
     use tracing::Span;
 
@@ -979,6 +1076,7 @@ mod tests {
             to_dispatch,
             cancellation,
             next_request_id: Arc::new(AtomicUsize::new(0)),
+            dispatch: Arc::new(Mutex::new(None)),
         };
         let cx = Context::from_waker(noop_waker_ref());
         (dispatch, channel, cx)
@@ -1076,6 +1174,7 @@ mod tests {
             to_dispatch,
             cancellation,
             next_request_id: Arc::new(AtomicUsize::new(0)),
+            dispatch: Arc::new(Mutex::new(None)),
         };
 
         (Box::pin(dispatch), channel, server_channel)

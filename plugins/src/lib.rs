@@ -732,13 +732,19 @@ impl ServiceGenerator<'_> {
         quote! {
             impl #client_ident {
                 /// Returns a new client stub that sends requests over the given transport.
+                ///
+                /// The returned `DispatchHandle` can be:
+                /// - **Spawned** (native): `tokio::spawn(dispatch)` - dispatch runs in background
+                /// - **Dropped** (WASM): Don't spawn it - `Channel::call()` will drive it automatically
                 #vis fn new<T>(config: ::tarpc::client::Config, transport: T)
                     -> ::tarpc::client::NewClient<
                         Self,
-                        ::tarpc::client::RequestDispatch<#request_ident, #response_ident, T>
+                        ::tarpc::client::DispatchHandle
                     >
                 where
-                    T: ::tarpc::Transport<::tarpc::ClientMessage<#request_ident>, ::tarpc::Response<#response_ident>>
+                    T: ::tarpc::Transport<::tarpc::ClientMessage<#request_ident>, ::tarpc::Response<#response_ident>> + ::core::marker::Send + 'static,
+                    #request_ident: ::core::marker::Send + 'static,
+                    #response_ident: ::core::marker::Send + 'static,
                 {
                     let new_client = ::tarpc::client::new(config, transport);
                     ::tarpc::client::NewClient {
