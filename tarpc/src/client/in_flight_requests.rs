@@ -8,7 +8,7 @@ use std::{
     task::{Context, Poll},
 };
 use tokio::sync::oneshot;
-use tokio_util::time::delay_queue::{self, DelayQueue};
+use crate::delay_queue::{self, DelayQueue};
 use tracing::Span;
 
 /// Requests already written to the wire that haven't yet received responses.

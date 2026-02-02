@@ -1,12 +1,12 @@
 use crate::util::{Compact, TimeUntil};
 use fnv::FnvHashMap;
 use futures::future::{AbortHandle, AbortRegistration};
+use crate::delay_queue::{self, DelayQueue};
+use crate::time::Instant;
 use std::{
     collections::hash_map,
     task::{Context, Poll},
-    time::Instant,
 };
-use tokio_util::time::delay_queue::{self, DelayQueue};
 use tracing::Span;
 
 /// A data structure that tracks in-flight requests. It aborts requests,

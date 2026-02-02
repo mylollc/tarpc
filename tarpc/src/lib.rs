@@ -244,13 +244,17 @@ pub use tarpc_plugins::service;
 pub(crate) mod cancellations;
 pub mod client;
 pub mod context;
+pub(crate) mod delay_queue;
 pub mod server;
+pub(crate) mod time;
 pub mod transport;
 pub(crate) mod util;
 
 pub use crate::transport::sealed::Transport;
 
-use std::{any::Any, error::Error, io, sync::Arc, time::Instant};
+use std::{any::Any, error::Error, io, sync::Arc};
+
+use crate::time::Instant;
 
 /// A message from a client to a server.
 #[derive(Debug)]

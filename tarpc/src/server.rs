@@ -23,10 +23,23 @@ use futures::{
 };
 use in_flight_requests::{AlreadyExistsError, InFlightRequests};
 use pin_project::pin_project;
-use std::{
-    convert::TryFrom, error::Error, fmt, marker::PhantomData, pin::Pin, sync::Arc, time::SystemTime,
-};
+use crate::time::Duration;
+use std::{convert::TryFrom, error::Error, fmt, marker::PhantomData, pin::Pin, sync::Arc};
 use tracing::{Span, info_span, instrument::Instrument};
+
+/// Formats a deadline (as duration from now) for tracing purposes.
+/// On native targets, formats as RFC3339 timestamp.
+/// On WASM, formats as duration string since std::time::SystemTime isn't available.
+fn format_deadline(time_until: Duration) -> String {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        humantime::format_rfc3339(std::time::SystemTime::now() + time_until).to_string()
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        format!("in {time_until:?}")
+    }
+}
 
 mod in_flight_requests;
 pub mod request_hook;
@@ -207,7 +220,7 @@ where
         let span = info_span!(
             "RPC",
             rpc.trace_id = %request.context.trace_id(),
-            rpc.deadline = %humantime::format_rfc3339(SystemTime::now() + request.context.deadline.time_until()),
+            rpc.deadline = %format_deadline(request.context.deadline.time_until()),
             otel.kind = "server",
             otel.name = tracing::field::Empty,
         );

@@ -10,10 +10,8 @@
 use crate::trace::{self, TraceId};
 use opentelemetry::trace::TraceContextExt;
 use static_assertions::assert_impl_all;
-use std::{
-    convert::TryFrom,
-    time::{Duration, Instant},
-};
+use crate::time::{Duration, Instant};
+use std::convert::TryFrom;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 /// A request context that carries request-scoped information like deadlines and trace information.
@@ -40,8 +38,8 @@ pub struct Context {
 
 #[cfg(feature = "serde1")]
 mod absolute_to_relative_time {
+    pub use crate::time::{Duration, Instant};
     pub use serde::{Deserialize, Deserializer, Serialize, Serializer};
-    pub use std::time::{Duration, Instant};
 
     pub fn serialize<S>(deadline: &Instant, serializer: S) -> Result<S::Ok, S::Error>
     where
