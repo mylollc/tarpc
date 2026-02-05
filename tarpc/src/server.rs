@@ -33,7 +33,8 @@ use tracing::{Span, info_span, instrument::Instrument};
 fn format_deadline(time_until: Duration) -> String {
     #[cfg(not(target_arch = "wasm32"))]
     {
-        humantime::format_rfc3339(std::time::SystemTime::now() + time_until).to_string()
+        use crate::time::SystemTime;
+        humantime::format_rfc3339(SystemTime::now() + time_until).to_string()
     }
     #[cfg(target_arch = "wasm32")]
     {

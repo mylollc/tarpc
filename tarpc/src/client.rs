@@ -32,6 +32,21 @@ use std::{
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::Span;
 
+/// Formats a deadline (as duration from now) for tracing purposes.
+/// On native targets, formats as RFC3339 timestamp.
+/// On WASM, formats as duration string since std::time::SystemTime isn't available.
+fn format_deadline(time_until: crate::time::Duration) -> String {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use crate::time::SystemTime;
+        humantime::format_rfc3339(SystemTime::now() + time_until).to_string()
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        format!("in {time_until:?}")
+    }
+}
+
 /// Settings that control the behavior of the client.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
@@ -189,7 +204,7 @@ where
         skip(self, ctx, request),
         fields(
             rpc.trace_id = tracing::field::Empty,
-            rpc.deadline = %humantime::format_rfc3339(SystemTime::now() + ctx.deadline.time_until()),
+            rpc.deadline = %format_deadline(ctx.deadline.time_until()),
             otel.kind = "client",
             otel.name = %request.name())
         )]

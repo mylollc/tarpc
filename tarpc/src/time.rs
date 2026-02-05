@@ -17,3 +17,9 @@ pub use std::time::Instant;
 
 #[cfg(target_arch = "wasm32")]
 pub use wasmtimer::std::Instant;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub use std::time::SystemTime;
+
+#[cfg(target_arch = "wasm32")]
+pub use wasmtimer::std::SystemTime;
